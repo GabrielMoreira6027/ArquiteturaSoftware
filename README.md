@@ -210,19 +210,3 @@ saga-architecture-ecommerce/
 └── docs/                               # Detalhamento técnico aprofundado
     └── decisoes-arquiteturais.md       # ADRs, riscos mitigados, DLQ e resiliência
 ```
-
----
-
-## 8. Como Submeter este Projeto ao GitHub
-
-Para enviar este repositório para o seu perfil no GitHub:
-
-1. Crie um novo repositório vazio no GitHub (ex.: `saga-pattern-ecommerce`).
-2. No seu terminal, navegue até a pasta do projeto:
-   ```bash
-   cd saga-architecture-ecommerce
-   ```
-3. O repositório remoto já está configurado como `origin`. Para enviar os arquivos:
-   ```bash
-   git push -u origin main
-   ```
