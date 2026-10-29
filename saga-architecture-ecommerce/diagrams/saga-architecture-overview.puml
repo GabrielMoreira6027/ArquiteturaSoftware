@@ -1,0 +1,84 @@
+@startuml saga-architecture-overview
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Segoe UI", Arial, sans-serif
+skinparam defaultFontSize 12
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam ArrowColor #2C3E50
+skinparam ArrowThickness 1.5
+
+header Padrão Saga - Arquitetura de Referência
+title <size:18><b>Visão Geral da Arquitetura: Padrão Saga por Orquestração</b></size>\n<size:12>Migração de E-Commerce Monolítico para Microsserviços com Consistência Eventual</size>
+
+actor "Cliente\n(Web / App)" as Client #E8F8F5
+
+package "Camada de Entrada / API Gateway" {
+    component "API Gateway\n(Kong / Envoy)" as Gateway #D4EFDF
+}
+
+package "Order Domain (Orquestrador / SEC)" #EBF5FB {
+    component "Order Service\n(Saga Orchestrator)" as OrderService #AED6F1
+    database "Order DB\n(PostgreSQL)\n- orders\n- saga_instance\n- saga_step_log\n- outbox_events" as OrderDB #85C1E9
+    component "Transactional Outbox\nPublisher (CDC / Poller)" as OrderOutbox #5DADE2
+}
+
+package "Barramento de Mensageria (Apache Kafka / RabbitMQ)" #FEF9E7 {
+    queue "cmd.inventory.reserve\ncmd.inventory.release" as InventoryCmdQueue #FADBD8
+    queue "cmd.payment.process" as PaymentCmdQueue #FADBD8
+    queue "evt.inventory.reserved\nevt.inventory.failed" as InventoryEvtQueue #D4EFDF
+    queue "evt.payment.completed\nevt.payment.failed" as PaymentEvtQueue #D4EFDF
+    queue "Dead-Letter Queue (DLQ)\n(Poison Pills / Excesso de Retries)" as DLQueue #EDBB99
+}
+
+package "Inventory Domain" #EAFAF1 {
+    component "Inventory Service\n(Idempotent Consumer)" as InventoryService #A9DFBF
+    database "Inventory DB\n(PostgreSQL)\n- stock_items\n- reservations\n- processed_messages\n- outbox_events" as InventoryDB #7DCEA0
+    component "Inventory Outbox\nPublisher" as InvOutbox #52BE80
+}
+
+package "Payment Domain" #F4ECF7 {
+    component "Payment Service\n(Idempotent Consumer)" as PaymentService #D2B4DE
+    database "Payment DB\n(PostgreSQL)\n- payments\n- processed_messages\n- outbox_events" as PaymentDB #BB8FCE
+    component "Payment Outbox\nPublisher" as PayOutbox #A569BD
+}
+
+cloud "Gateway Financeiro Externo\n(Stripe / Adyen / Cielo)" as ExternalGateway #FDEDEC
+
+package "Plataforma de Observabilidade e Resiliência" #F2F4F4 {
+    component "Distributed Tracing (OpenTelemetry)\n+ Métricas (Prometheus / Grafana)" as Obs #BDC3C7
+}
+
+Client -down-> Gateway : 1. POST /api/v1/orders
+Gateway -down-> OrderService : 2. Encaminha Requisição
+OrderService -right-> OrderDB : 3. Transação ACID Local\n(Cria Pedido PENDING + Saga STARTED + Outbox)
+OrderDB -down-> OrderOutbox : 4. CDC captura evento do Outbox
+OrderOutbox -down-> InventoryCmdQueue : 5. Publica ReserveStockCommand
+
+InventoryCmdQueue -down-> InventoryService : 6. Consome comando\n(Deduplica via processed_messages)
+InventoryService -right-> InventoryDB : 7. Reserva Estoque & Registra Mensagem
+InventoryDB -down-> InvOutbox : 8. CDC captura evento do Outbox
+InvOutbox -up-> InventoryEvtQueue : 9. Publica StockReservedEvent
+
+InventoryEvtQueue -up-> OrderService : 10. Orquestrador atualiza Saga Log\n(Passo 1 = SUCCESS)
+OrderService -right-> OrderDB : 11. Grava ProcessPaymentCommand no Outbox
+OrderOutbox -down-> PaymentCmdQueue : 12. Publica ProcessPaymentCommand
+
+PaymentCmdQueue -down-> PaymentService : 13. Consome comando (Idempotente)
+PaymentService -down-> ExternalGateway : 14. Chamada de Cobrança (HTTPS/REST)
+ExternalGateway -up-> PaymentService : 15. Retorno (Sucesso / Falha)
+PaymentService -right-> PaymentDB : 16. Grava Pagamento & Outbox
+PaymentDB -down-> PayOutbox : 17. CDC captura evento do Outbox
+PayOutbox -up-> PaymentEvtQueue : 18. Publica PaymentCompletedEvent / PaymentFailedEvent
+
+PaymentEvtQueue -up-> OrderService : 19. Orquestrador finaliza com sucesso\nou dispara compensação LIFO
+
+InventoryService .right.> DLQueue : Falhas Graves / Poison Pills
+PaymentService .right.> DLQueue : Falhas Irrecuperáveis
+
+OrderService .left.> Obs : TraceID / SagaID
+InventoryService .left.> Obs : TraceID / SagaID
+PaymentService .left.> Obs : TraceID / SagaID
+
+footer Arquitetura de Referência - Padrão Saga por Orquestração
+@enduml

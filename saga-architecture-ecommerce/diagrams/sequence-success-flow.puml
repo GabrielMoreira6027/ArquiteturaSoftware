@@ -1,0 +1,104 @@
+@startuml sequence-success-flow
+!theme plain
+autonumber "<b>[00]</b>"
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Segoe UI", Arial, sans-serif
+skinparam defaultFontSize 11
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam BoxPadding 10
+skinparam ParticipantPadding 10
+skinparam ArrowColor #1A5276
+skinparam ArrowThickness 1.3
+
+title <size:16><b>Fluxo de Sucesso (Happy Path) - Padrão Saga por Orquestração</b></size>\n<size:11>Processamento Transacional Distribuído com Consistência Eventual</size>
+
+actor "Cliente / App" as Client #E8F8F5
+participant "API Gateway" as Gateway #D4EFDF
+box "Order Domain (Orquestrador)" #EBF5FB
+    participant "Order Service\n(Saga Orchestrator)" as OrderService #AED6F1
+    database "Order DB" as OrderDB #85C1E9
+end box
+
+participant "Message Broker\n(Kafka / RabbitMQ)" as Broker #FEF9E7
+
+box "Inventory Domain" #EAFAF1
+    participant "Inventory Service\n(Idempotent Consumer)" as InventoryService #A9DFBF
+    database "Inventory DB" as InventoryDB #7DCEA0
+end box
+
+box "Payment Domain" #F4ECF7
+    participant "Payment Service\n(Idempotent Consumer)" as PaymentService #D2B4DE
+    database "Payment DB" as PaymentDB #BB8FCE
+end box
+
+participant "Gateway Financeiro\n(Externo)" as FinGateway #FDEDEC
+
+== 1. Criação do Pedido e Início da Saga ==
+Client -> Gateway : POST /api/v1/orders {items, total, payment_data}
+Gateway -> OrderService : Encaminha requisição com TraceID / RequestID
+
+OrderService -> OrderDB : [Transação ACID Local]\n1. INSERT INTO orders (status='PENDING')\n2. INSERT INTO saga_instance (status='STARTED')\n3. INSERT INTO outbox (cmd='ReserveStockCommand')
+OrderDB --> OrderService : Commit OK (order_id, saga_id)
+
+OrderService --> Gateway : 202 Accepted {order_id, saga_id, status='PENDING'}
+Gateway --> Client : 202 Accepted (Informa processamento assíncrono)
+
+OrderService -> Broker : [Outbox / CDC] Publica 'ReserveStockCommand'\nno tópico 'cmd.inventory.reserve'
+
+== 2. Reserva de Estoque (Transação Pivot / Compensável) ==
+Broker -> InventoryService : Entrega 'ReserveStockCommand' {order_id, items}
+activate InventoryService
+
+InventoryService -> InventoryDB : [Transação ACID Local com Idempotência]\n1. INSERT INTO processed_messages (msg_id, saga_id) ON CONFLICT DO NOTHING\n2. UPDATE stock SET available = available - qty, reserved = reserved + qty\n3. INSERT INTO reservations (status='HOLD')\n4. INSERT INTO outbox (evt='StockReservedEvent')
+InventoryDB --> InventoryService : Commit OK
+
+InventoryService --> Broker : ACK de mensagem processada
+deactivate InventoryService
+
+InventoryService -> Broker : [Outbox / CDC] Publica 'StockReservedEvent'\nno tópico 'evt.inventory.reserved'
+
+Broker -> OrderService : Entrega 'StockReservedEvent' {order_id, saga_id}
+activate OrderService
+
+OrderService -> OrderDB : [Transação ACID Local]\n1. UPDATE saga_instance SET current_step='STOCK_RESERVED'\n2. INSERT INTO saga_step_log (step='INVENTORY', status='SUCCESS')\n3. INSERT INTO outbox (cmd='ProcessPaymentCommand')
+OrderDB --> OrderService : Commit OK
+
+OrderService --> Broker : ACK de evento
+deactivate OrderService
+
+OrderService -> Broker : [Outbox / CDC] Publica 'ProcessPaymentCommand'\nno tópico 'cmd.payment.process'
+
+== 3. Processamento de Pagamento (Transação Pivot) ==
+Broker -> PaymentService : Entrega 'ProcessPaymentCommand' {order_id, amount, payment_token}
+activate PaymentService
+
+PaymentService -> PaymentDB : SELECT msg_id FROM processed_messages\n(Verifica Idempotência)
+PaymentDB --> PaymentService : Não processado ainda
+
+PaymentService -> FinGateway : POST /v1/charges {amount, token, idempotency_key}
+activate FinGateway
+FinGateway --> PaymentService : 200 OK {charge_id='ch_9988', status='AUTHORIZED'}
+deactivate FinGateway
+
+PaymentService -> PaymentDB : [Transação ACID Local]\n1. INSERT INTO payments (status='CAPTURED', charge_id)\n2. INSERT INTO processed_messages (msg_id, saga_id)\n3. INSERT INTO outbox (evt='PaymentCompletedEvent')
+PaymentDB --> PaymentService : Commit OK
+
+PaymentService --> Broker : ACK de mensagem processada
+deactivate PaymentService
+
+PaymentService -> Broker : [Outbox / CDC] Publica 'PaymentCompletedEvent'\nno tópico 'evt.payment.completed'
+
+== 4. Conclusão da Saga e Confirmação do Pedido ==
+Broker -> OrderService : Entrega 'PaymentCompletedEvent' {order_id, saga_id, charge_id}
+activate OrderService
+
+OrderService -> OrderDB : [Transação ACID Local]\n1. UPDATE saga_instance SET status='COMPLETED'\n2. INSERT INTO saga_step_log (step='PAYMENT', status='SUCCESS')\n3. UPDATE orders SET status='PAID_CONFIRMED'\n4. INSERT INTO outbox (evt='OrderCompletedEvent')
+OrderDB --> OrderService : Commit OK
+
+OrderService --> Broker : ACK de evento
+deactivate OrderService
+
+OrderService -> Client : [WebSocket / SSE / Push Notification]\n"Pedido #12345 Confirmado com Sucesso!"
+
+@enduml

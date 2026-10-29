@@ -1,0 +1,110 @@
+@startuml sequence-compensation-flow
+!theme plain
+autonumber "<b>[00]</b>"
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "Segoe UI", Arial, sans-serif
+skinparam defaultFontSize 11
+skinparam roundCorner 8
+skinparam shadowing false
+skinparam BoxPadding 10
+skinparam ParticipantPadding 10
+skinparam ArrowColor #922B21
+skinparam ArrowThickness 1.3
+
+title <size:16><b>Fluxo de Falha e Transações Compensatórias</b></size>\n<size:11>Recusa de Pagamento pelo Gateway e Liberação de Estoque (Rollback Semântico LIFO)</size>
+
+actor "Cliente / App" as Client #E8F8F5
+participant "API Gateway" as Gateway #D4EFDF
+box "Order Domain (Orquestrador)" #EBF5FB
+    participant "Order Service\n(Saga Orchestrator)" as OrderService #AED6F1
+    database "Order DB" as OrderDB #85C1E9
+end box
+
+participant "Message Broker\n(Kafka / RabbitMQ)" as Broker #FEF9E7
+
+box "Inventory Domain" #EAFAF1
+    participant "Inventory Service\n(Idempotent Consumer)" as InventoryService #A9DFBF
+    database "Inventory DB" as InventoryDB #7DCEA0
+end box
+
+box "Payment Domain" #F4ECF7
+    participant "Payment Service\n(Idempotent Consumer)" as PaymentService #D2B4DE
+    database "Payment DB" as PaymentDB #BB8FCE
+end box
+
+participant "Gateway Financeiro\n(Externo)" as FinGateway #FDEDEC
+
+== 1. Etapa Anterior: Reserva de Estoque Concluída com Sucesso ==
+note over OrderService, InventoryService #EAFAF1
+  O pedido foi criado em status PENDING e o Inventory Service reservou o estoque com sucesso.
+  Order Orchestrator registrou 'INVENTORY_RESERVATION' como SUCCESS no Saga Log.
+end note
+
+OrderService -> Broker : [Outbox / CDC] Publica 'ProcessPaymentCommand'\nno tópico 'cmd.payment.process'
+
+== 2. Tentativa de Pagamento e Falha de Negócio ==
+Broker -> PaymentService : Entrega 'ProcessPaymentCommand' {order_id, amount, payment_token}
+activate PaymentService
+
+PaymentService -> PaymentDB : Verifica deduplicação (processed_messages)
+PaymentDB --> PaymentService : Não duplicado
+
+PaymentService -> FinGateway : POST /v1/charges {amount, token, idempotency_key}
+activate FinGateway
+FinGateway --> PaymentService : <b>422 Unprocessable Entity</b>\n{error: 'INSUFFICIENT_FUNDS', code: 'card_declined'}
+deactivate FinGateway
+
+note right of PaymentService #FADBD8
+  Falha definitiva de negócio (não-transitória).
+  Não se aplica retry de gateway.
+end note
+
+PaymentService -> PaymentDB : [Transação ACID Local]\n1. INSERT INTO payments (status='REJECTED', reason='INSUFFICIENT_FUNDS')\n2. INSERT INTO processed_messages (msg_id, saga_id)\n3. INSERT INTO outbox (evt='PaymentFailedEvent')
+PaymentDB --> PaymentService : Commit OK
+
+PaymentService --> Broker : ACK de mensagem processada
+deactivate PaymentService
+
+PaymentService -> Broker : [Outbox / CDC] Publica 'PaymentFailedEvent'\nno tópico 'evt.payment.failed'
+
+== 3. Orquestrador Inicia Gatilho de Compensação ==
+Broker -> OrderService : Entrega 'PaymentFailedEvent' {order_id, saga_id, reason}
+activate OrderService
+
+OrderService -> OrderDB : [Transação ACID Local]\n1. UPDATE saga_instance SET status='COMPENSATING'\n2. INSERT INTO saga_step_log (step='PAYMENT', status='FAILED', reason='INSUFFICIENT_FUNDS')\n3. SELECT executed_steps FROM saga_step_log WHERE status='SUCCESS'\n4. INSERT INTO outbox (cmd='ReleaseStockCommand')
+note right of OrderDB #FCF3CF
+  Orquestrador consulta o Saga Log e identifica
+  que a Reserva de Estoque precisa ser desfeita (LIFO).
+end note
+OrderDB --> OrderService : Commit OK
+
+OrderService --> Broker : ACK de evento
+deactivate OrderService
+
+OrderService -> Broker : [Outbox / CDC] Publica 'ReleaseStockCommand'\nno tópico 'cmd.inventory.release'
+
+== 4. Transação Compensatória no Inventory Service ==
+Broker -> InventoryService : Entrega 'ReleaseStockCommand' {order_id, saga_id, items}
+activate InventoryService
+
+InventoryService -> InventoryDB : [Transação ACID Local de Compensação]\n1. INSERT INTO processed_messages (msg_id, saga_id) ON CONFLICT DO NOTHING\n2. UPDATE stock SET available = available + qty, reserved = reserved - qty\n3. UPDATE reservations SET status='RELEASED' WHERE order_id=...\n4. INSERT INTO outbox (evt='StockReleasedEvent')
+InventoryDB --> InventoryService : Commit OK
+
+InventoryService --> Broker : ACK de mensagem de compensação
+deactivate InventoryService
+
+InventoryService -> Broker : [Outbox / CDC] Publica 'StockReleasedEvent'\nno tópico 'evt.inventory.released'
+
+== 5. Finalização da Saga com Reversão Concluída ==
+Broker -> OrderService : Entrega 'StockReleasedEvent' {order_id, saga_id}
+activate OrderService
+
+OrderService -> OrderDB : [Transação ACID Local]\n1. INSERT INTO saga_step_log (step='INVENTORY_COMPENSATION', status='SUCCESS')\n2. UPDATE saga_instance SET status='FAILED_AND_COMPENSATED'\n3. UPDATE orders SET status='CANCELLED', cancel_reason='PAYMENT_DECLINED'\n4. INSERT INTO outbox (evt='OrderCancelledEvent')
+OrderDB --> OrderService : Commit OK
+
+OrderService --> Broker : ACK de evento
+deactivate OrderService
+
+OrderService -> Client : [Notificação Push / WebSocket / Email]\n"Pagamento recusado: Saldo Insuficiente.\nSeu pedido foi cancelado e a reserva de produtos liberada."
+
+@enduml
