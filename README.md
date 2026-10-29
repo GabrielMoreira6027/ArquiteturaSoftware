@@ -190,20 +190,6 @@ CREATE TABLE saga_instance (
 * **Tratamento de Timeouts:** Se um serviço externo não responder no intervalo limite (`timeout_deadline`), um processo em background (**Saga Sweeper**) consulta a tabela de estado.
 * Antes de compensar, o orquestrador executa uma consulta de estado (*Inquiry Pattern*) ao serviço de pagamento para assegurar que a cobrança não foi processada silenciosamente. Se o serviço permanecer mudo, a compensação reversa é ativada.
 
----
-
-## 7. Estrutura do Repositório
-
-```
-saga-architecture-ecommerce/
-│
-├── README.md                           # Documentação executiva principal
-│
-├── diagrams/                           # Artefatos visuais de arquitetura
-│   ├── saga-architecture-overview.png  # Visão geral de serviços e mensageria
-│   ├── saga-architecture-overview.puml # Código-fonte PlantUML da arquitetura
-│   ├── sequence-success-flow.png       # Diagrama de sequência do fluxo de sucesso
-│   ├── sequence-success-flow.puml      # Código-fonte PlantUML do fluxo de sucesso
 │   ├── sequence-compensation-flow.png  # Diagrama de sequência do fluxo de compensação
 │   └── sequence-compensation-flow.puml # Código-fonte PlantUML da compensação
 │
